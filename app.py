@@ -163,22 +163,30 @@ class ProgressTrackerDB:
             return pd.read_sql_query(query, self.conn, params=(project_id,))
 
 
-# --- دالة استخراج الجداول من PDF ---
+# --- دالة استخراج الجداول من PDF المحدثة مع معالجة خطأ الدمج ---
 def extract_boq_from_pdf(pdf_file):
-    all_tables = []
+    all_rows = []
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
             tables = page.extract_tables()
             for table in tables:
                 if table:
-                    df_page = pd.DataFrame(table)
-                    # تحسين شكل الجدول واعتماد السطر الأول كعناوين إن أمكن
-                    df_page.columns = df_page.iloc[0]
-                    df_page = df_page[1:].reset_index(drop=True)
-                    all_tables.append(df_page)
+                    for row in table:
+                        cleaned_row = [
+                            str(cell).strip() if cell is not None else ""
+                            for cell in row
+                        ]
+                        if any(cleaned_row):
+                            all_rows.append(cleaned_row)
 
-    if all_tables:
-        return pd.concat(all_tables, ignore_index=True)
+    if all_rows:
+        raw_df = pd.DataFrame(all_rows)
+        header = raw_df.iloc[0]
+        final_df = raw_df[1:].copy()
+        final_df.columns = [
+            f"Col_{i+1}: {col}" for i, col in enumerate(header)
+        ]
+        return final_df.reset_index(drop=True)
     return None
 
 
