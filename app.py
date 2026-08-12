@@ -1,11 +1,7 @@
 import sqlite3
 from datetime import date
-import io
 import arabic_reshaper
 from bidi.algorithm import get_display
-import numpy as np
-
-# استيراد المكتبات الأساسية
 import pandas as pd
 import pdfplumber
 import streamlit as st
@@ -145,21 +141,24 @@ class ProgressTrackerDB:
             return pd.read_sql_query(query, self.conn, params=(project_id,))
 
 
-# --- 3. دالة معالجة واستخراج الجداول المعقدة والـ CID ---
-def fix_text_encoding(val):
+# --- 3. معالجة وتصحيح ترتيب ونصوص الجدول ---
+def fix_cell_text(val):
     if not val or str(val).strip() in ["None", ""]:
         return ""
     text = str(val).strip()
 
-    # إذا كان النص يحتوي على رمكوز cid المشوهة يتم تنظيفه
+    # تنظيف رموز cid المكسورة
     if "cid:" in text:
         return ""
 
-    # إصلاح معكوسات اللغة العربية
+    # تصحيح عكس الكلمات العربية والمجزءة
     try:
-        # فحص إذا كان الكلام يحتوي حروف عربية معكوسة
-        if any("\u0600" <= c <= "\u06ff" for c in text):
-            # إذا كان النص معكوساً بالكامل
+        # إذا كان النص مكسوراً ومشقلباً (مثل .1 أو m3)
+        if (
+            any("\u0600" <= c <= "\u06ff" for c in text)
+            or text.startswith(".")
+            or text.endswith("3")
+        ):
             reshaped = arabic_reshaper.reshape(text)
             return get_display(reshaped)
         return text
@@ -167,51 +166,35 @@ def fix_text_encoding(val):
         return text
 
 
-def extract_boq_from_pdf(pdf_file):
+def extract_boq_from_pdf(pdf_file, reverse_columns=True):
     all_rows = []
-
-    # استخدام pdfplumber مع إعدادات استخراج الجداول المتقدمة (Table Extraction Strategy)
-    table_settings = {
-        "vertical_strategy": "lines",
-        "horizontal_strategy": "lines",
-        "snap_tolerance": 3,
-        "join_tolerance": 3,
-    }
 
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
-            # المحاولة الأولى بالطرق الهندسية للجدول
-            tables = page.extract_tables(table_settings)
-
-            # إذا لم يجد جداول مسطرة، يقرأ بالاعتماد على الفراغات النصية
-            if not tables:
-                tables = page.extract_tables()
-
+            tables = page.extract_tables()
             for table in tables:
                 if table:
                     for row in table:
-                        cleaned_row = [fix_text_encoding(cell) for cell in row]
-                        # التأكد من أن الصف يحتوي على بيانات حقيقية وليس فارغاً
+                        cleaned_row = [fix_cell_text(cell) for cell in row]
                         if any(cleaned_row):
                             all_rows.append(cleaned_row)
 
     if all_rows:
         raw_df = pd.DataFrame(all_rows)
 
-        # حذف الصفوف والأعمدة الفارغة بالكامل
-        raw_df.dropna(how="all", inplace=True)
+        # 🔄 عكس ترتيب الأعمدة من اليمين إلى اليسار ليصبح كود/رقم البند هو العمود الأول
+        if reverse_columns:
+            raw_df = raw_df.iloc[:, ::-1]
 
-        # تصحيح عناوين الأعمدة
-        cols = []
-        for i, col in enumerate(raw_df.columns):
-            cols.append(f"العمود {i+1}")
+        # إعادة تسمية العناوين
+        cols = [f"العمود {i+1}" for i in range(raw_df.shape[1])]
         raw_df.columns = cols
 
         return raw_df.reset_index(drop=True)
     return None
 
 
-# --- 4. واجهة المستخدِم ---
+# --- 4. واجهة المستخدم ---
 db = ProgressTrackerDB()
 
 st.title(
@@ -248,23 +231,28 @@ with tab2:
             "📄 قراءة واستخراج جميع بنود الـ BOQ من ملف PDF لـ"
             f" ({selected_project_name})"
         )
-        pdf_file = st.file_uploader(
-            "اختر ملف الـ BOQ بصيغة PDF", type=["pdf"], key="boq_pdf_uploader"
-        )
+
+        col_up1, col_up2 = st.columns([3, 1])
+        with col_up1:
+            pdf_file = st.file_uploader(
+                "اختر ملف الـ BOQ بصيغة PDF",
+                type=["pdf"],
+                key="boq_pdf_uploader",
+            )
+        with col_up2:
+            st.write("⚙️ خيارات الاتجاه:")
+            flip_cols = st.checkbox(
+                "عكس ترتيب الأعمدة (يمين ↔ شمال)", value=True
+            )
 
         if pdf_file is not None:
-            with st.spinner(
-                "جاري معالجة وتفكيك رموز الملف واستخراج الجدول..."
-            ):
-                extracted_df = extract_boq_from_pdf(pdf_file)
-
-            if extracted_df is not None and not extracted_df.empty:
-                st.success(
-                    f"تم استخراج الجدول بنجاح! عدد الصفوف:"
-                    f" {len(extracted_df)}"
+            with st.spinner("جاري تعديل ترتيب الأعمدة وتعديل النصوص..."):
+                extracted_df = extract_boq_from_pdf(
+                    pdf_file, reverse_columns=flip_cols
                 )
 
-                # تنقية وعرض الجدول
+            if extracted_df is not None and not extracted_df.empty:
+                st.success(f"تم استخراج الجدول! عدد الصفوف: {len(extracted_df)}")
                 st.dataframe(extracted_df, use_container_width=True)
 
                 st.divider()
