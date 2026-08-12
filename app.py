@@ -1,9 +1,13 @@
+import io
 import sqlite3
 from datetime import date
 import arabic_reshaper
 from bidi.algorithm import get_display
+import easyocr
+import numpy as np
 import pandas as pd
-import pdfplumber
+from pdf2image import convert_from_bytes
+from PIL import Image
 import streamlit as st
 
 # --- 1. إعداد الصفحة والاتجاه RTL ---
@@ -40,317 +44,122 @@ st.markdown(
 )
 
 
-# --- 2. محرك قاعدة البيانات ---
-class ProgressTrackerDB:
-
-    def __init__(self, db_name="project_progress.db"):
-        self.conn = sqlite3.connect(db_name, check_same_thread=False)
-        self.create_tables()
-
-    def create_tables(self):
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS projects (
-                project_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                project_name TEXT UNIQUE,
-                client_name TEXT,
-                created_at TEXT
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS boq_master (
-                boq_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                project_id INTEGER,
-                boq_code TEXT,
-                description TEXT,
-                unit TEXT,
-                contract_qty REAL,
-                unit_rate REAL,
-                FOREIGN KEY (project_id) REFERENCES projects (project_id),
-                UNIQUE(project_id, boq_code)
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS wir_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                project_id INTEGER,
-                wir_id TEXT,
-                wir_date TEXT,
-                boq_code TEXT,
-                location TEXT,
-                approved_qty REAL,
-                status TEXT,
-                created_by TEXT,
-                FOREIGN KEY (project_id) REFERENCES projects (project_id)
-            )
-        """)
-        self.conn.commit()
-
-    def add_project(self, name, client):
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute(
-                "INSERT INTO projects (project_name, client_name, created_at)"
-                " VALUES (?, ?, ?)",
-                (name, client, str(date.today())),
-            )
-            self.conn.commit()
-            return True, "تم إضافة المشروع بنجاح!"
-        except sqlite3.IntegrityError:
-            return False, "اسم المشروع موجود بالفعل."
-
-    def get_projects(self):
-        return pd.read_sql_query("SELECT * FROM projects", self.conn)
-
-    def add_boq_item(self, project_id, code, desc, unit, qty, rate):
-        cursor = self.conn.cursor()
-        cursor.execute(
-            """
-            INSERT OR REPLACE INTO boq_master (project_id, boq_code, description, unit, contract_qty, unit_rate)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """,
-            (project_id, code, desc, unit, qty, rate),
-        )
-        self.conn.commit()
-
-    def get_boq_summary(self, project_id, boq_code=None):
-        query = """
-            SELECT 
-                b.boq_code,
-                b.description,
-                b.unit,
-                b.contract_qty,
-                b.unit_rate,
-                (b.contract_qty * b.unit_rate) as total_budget,
-                COALESCE(SUM(w.approved_qty), 0) as cum_qty,
-                (b.contract_qty - COALESCE(SUM(w.approved_qty), 0)) as remaining_qty,
-                (COALESCE(SUM(w.approved_qty), 0) / b.contract_qty) * 100 as physical_progress_pct,
-                (COALESCE(SUM(w.approved_qty), 0) * b.unit_rate) as earned_value
-            FROM boq_master b
-            LEFT JOIN wir_log w ON b.boq_code = w.boq_code AND b.project_id = w.project_id
-            WHERE b.project_id = ?
-        """
-        if boq_code:
-            query += " AND b.boq_code = ? GROUP BY b.boq_code"
-            df = pd.read_sql_query(
-                query, self.conn, params=(project_id, boq_code)
-            )
-            return df.to_dict("records")[0] if not df.empty else None
-        else:
-            query += " GROUP BY b.boq_code"
-            return pd.read_sql_query(query, self.conn, params=(project_id,))
+# --- 2. محرك قراءة الـ PDF البصري الجذرى (OCR Engine) ---
+@st.cache_resource
+def init_ocr_reader():
+    # تحميل قارئ النصوص للغتين العربية والإنجليزية
+    return easyocr.Reader(["ar", "en"], gpu=False)
 
 
-# --- 3. معالجة وتصحيح ترتيب ونصوص الجدول ---
-def fix_cell_text(val):
-    if not val or str(val).strip() in ["None", ""]:
-        return ""
-    text = str(val).strip()
+reader = init_ocr_reader()
 
-    # تنظيف رموز cid المكسورة
-    if "cid:" in text:
-        return ""
 
-    # تصحيح عكس الكلمات العربية والمجزءة
+def process_pdf_with_ocr(pdf_bytes):
+    """تحويل الـ PDF لصور وقراءة النصوص حسب إحداثيات الصفوف والأعمدة"""
     try:
-        # إذا كان النص مكسوراً ومشقلباً (مثل .1 أو m3)
-        if (
-            any("\u0600" <= c <= "\u06ff" for c in text)
-            or text.startswith(".")
-            or text.endswith("3")
-        ):
-            reshaped = arabic_reshaper.reshape(text)
-            return get_display(reshaped)
-        return text
-    except Exception:
-        return text
+        images = convert_from_bytes(pdf_bytes)
+    except Exception as e:
+        st.error(
+            "تأكد من تثبيت مكتبة Poppler على النظام لدعم تحويل PDF إلى صور."
+        )
+        return None
 
+    all_extracted_rows = []
 
-def extract_boq_from_pdf(pdf_file, reverse_columns=True):
-    all_rows = []
+    for page_idx, img in enumerate(images):
+        img_np = np.array(img)
 
-    with pdfplumber.open(pdf_file) as pdf:
-        for page in pdf.pages:
-            tables = page.extract_tables()
-            for table in tables:
-                if table:
-                    for row in table:
-                        cleaned_row = [fix_cell_text(cell) for cell in row]
-                        if any(cleaned_row):
-                            all_rows.append(cleaned_row)
+        # استخراج الكلمات مع إحداثياتها: [(bbox, text, prob), ...]
+        results = reader.readtext(img_np)
 
-    if all_rows:
-        raw_df = pd.DataFrame(all_rows)
+        if not results:
+            continue
 
-        # 🔄 عكس ترتيب الأعمدة من اليمين إلى اليسار ليصبح كود/رقم البند هو العمود الأول
-        if reverse_columns:
-            raw_df = raw_df.iloc[:, ::-1]
+        # تجميع النصوص بناءً على الإحداثي الرأسي Y (الصفوف) ثم الأفقي X (الأعمدة من اليمين للياسار)
+        items = []
+        for bbox, text, prob in results:
+            if prob < 0.2:  # استبعاد القراءات الضعيفة جداً
+                continue
 
-        # إعادة تسمية العناوين
-        cols = [f"العمود {i+1}" for i in range(raw_df.shape[1])]
-        raw_df.columns = cols
+            # حساب مركز الكلمة (Y_center, X_center)
+            y_center = (bbox[0][1] + bbox[2][1]) / 2
+            x_center = (bbox[0][0] + bbox[1][0]) / 2
 
-        return raw_df.reset_index(drop=True)
+            # إصلاح النص العربي المقلوب
+            try:
+                reshaped = arabic_reshaper.reshape(text)
+                clean_text = get_display(reshaped)
+            except:
+                clean_text = text
+
+            items.append({
+                "y": y_center,
+                "x": x_center,
+                "text": clean_text.strip(),
+            })
+
+        # فرز البنود حسب الصفوف (Y)
+        items.sort(key=lambda item: item["y"])
+
+        # تقسيم البنود إلى صفوف (الكلمات ذات الإحداثي Y المتقارب تنتمي لنفس الصف)
+        rows = []
+        current_row = []
+        last_y = None
+        y_threshold = 18  # المسافة الرأسية لتمييز السطر الجديد
+
+        for item in items:
+            if last_y is None or abs(item["y"] - last_y) < y_threshold:
+                current_row.append(item)
+            else:
+                # ترتيب كلمات الصف الحالي من اليمين إلى اليسار (X تنازلي)
+                current_row.sort(key=lambda item: item["x"], reverse=True)
+                rows.append([it["text"] for it in current_row])
+                current_row = [item]
+            last_y = item["y"]
+
+        if current_row:
+            current_row.sort(key=lambda item: item["x"], reverse=True)
+            rows.append([it["text"] for it in current_row])
+
+        all_extracted_rows.extend(rows)
+
+    if all_extracted_rows:
+        # توحيد أطوال الأعمدة
+        max_cols = max(len(r) for r in all_extracted_rows)
+        padded_rows = [r + [""] * (max_cols - len(r)) for r in all_extracted_rows]
+
+        df = pd.DataFrame(padded_rows)
+        cols = [f"العمود {i+1}" for i in range(df.shape[1])]
+        df.columns = cols
+        return df
+
     return None
 
 
-# --- 4. واجهة المستخدم ---
-db = ProgressTrackerDB()
-
+# --- 3. واجهة الاستخدام ---
 st.title(
     "🏗️ منصة إدارة المشاريع والكميات - شركة العامرية المتحدة للمقاولات"
 )
 
-st.sidebar.title("👨‍💼 تطوير وإعداد")
-st.sidebar.markdown("**المهندس:** أحمد السيد")
-st.sidebar.markdown("📱 **تليفون / واتساب:** `0546226304`")
-st.sidebar.markdown("📧 **البريد:** `ahmadalsayed9797@gmail.com`")
-st.sidebar.divider()
+st.subheader("📄 الاستخراج الذكي لجدول الـ BOQ من ملف PDF مباشرة")
 
-projects_df = db.get_projects()
-
-if not projects_df.empty:
-    project_options = dict(
-        zip(projects_df["project_name"], projects_df["project_id"])
-    )
-    selected_project_name = st.sidebar.selectbox(
-        "📂 اختر المشروع الحالي:", list(project_options.keys())
-    )
-    selected_project_id = project_options[selected_project_name]
-else:
-    st.sidebar.warning("يرجى إضافة مشروع جديد أولاً.")
-    selected_project_id = None
-
-tab1, tab2, tab3 = st.tabs(
-    ["📊 تقرير المشروع الحسابي", "📄 قراءة BOQ من PDF", "➕ إدارة المشاريع"]
+uploaded_pdf = st.file_uploader(
+    "اختر ملف الـ BOQ بصيغة PDF", type=["pdf"], key="pdf_ocr_uploader"
 )
 
-with tab2:
-    if selected_project_id:
-        st.subheader(
-            "📄 قراءة واستخراج جميع بنود الـ BOQ من ملف PDF لـ"
-            f" ({selected_project_name})"
+if uploaded_pdf is not None:
+    pdf_bytes = uploaded_pdf.read()
+
+    with st.spinner("جاري المسح البصري الذكي للـ PDF وإعادة ترتيب الجداول..."):
+        df_result = process_pdf_with_ocr(pdf_bytes)
+
+    if df_result is not None and not df_result.empty:
+        st.success(
+            f"تم التعرف البصري على الجدول بنجاح! إجمالي الصفوف المستخرجة:"
+            f" {len(df_result)}"
         )
-
-        col_up1, col_up2 = st.columns([3, 1])
-        with col_up1:
-            pdf_file = st.file_uploader(
-                "اختر ملف الـ BOQ بصيغة PDF",
-                type=["pdf"],
-                key="boq_pdf_uploader",
-            )
-        with col_up2:
-            st.write("⚙️ خيارات الاتجاه:")
-            flip_cols = st.checkbox(
-                "عكس ترتيب الأعمدة (يمين ↔ شمال)", value=True
-            )
-
-        if pdf_file is not None:
-            with st.spinner("جاري تعديل ترتيب الأعمدة وتعديل النصوص..."):
-                extracted_df = extract_boq_from_pdf(
-                    pdf_file, reverse_columns=flip_cols
-                )
-
-            if extracted_df is not None and not extracted_df.empty:
-                st.success(f"تم استخراج الجدول! عدد الصفوف: {len(extracted_df)}")
-                st.dataframe(extracted_df, use_container_width=True)
-
-                st.divider()
-                st.markdown(
-                    "### 💾 ربط وتسكين الأعمدة في قاعدة بيانات المشروع"
-                )
-
-                cols = list(extracted_df.columns)
-                col1, col2, col3 = st.columns(3)
-                col4, col5, _ = st.columns(3)
-
-                with col1:
-                    col_code = st.selectbox(
-                        "كود البند / الرقم:", cols, index=0
-                    )
-                with col2:
-                    col_desc = st.selectbox(
-                        "وصف البند:", cols, index=min(1, len(cols) - 1)
-                    )
-                with col3:
-                    col_unit = st.selectbox(
-                        "الوحدة:", cols, index=min(2, len(cols) - 1)
-                    )
-                with col4:
-                    col_qty = st.selectbox(
-                        "الكمية:", cols, index=min(3, len(cols) - 1)
-                    )
-                with col5:
-                    col_rate = st.selectbox(
-                        "السعر / الفئة:", cols, index=min(4, len(cols) - 1)
-                    )
-
-                if st.button("✅ حفظ الجدول كاملاً في قاعدة البيانات"):
-                    saved_count = 0
-                    for _, row in extracted_df.iterrows():
-                        try:
-                            code_val = str(row[col_code]).strip()
-                            desc_val = str(row[col_desc]).strip()
-                            unit_val = str(row[col_unit]).strip()
-                            qty_val = float(
-                                str(row[col_qty])
-                                .replace(",", "")
-                                .replace(" ", "")
-                            )
-                            rate_val = float(
-                                str(row[col_rate])
-                                .replace(",", "")
-                                .replace(" ", "")
-                            )
-
-                            if code_val and qty_val >= 0:
-                                db.add_boq_item(
-                                    selected_project_id,
-                                    code_val,
-                                    desc_val,
-                                    unit_val,
-                                    qty_val,
-                                    rate_val,
-                                )
-                                saved_count += 1
-                        except Exception:
-                            continue
-
-                    st.success(
-                        f"تم حفظ {saved_count} بند في المشروع بنجاح!"
-                    )
-                    st.rerun()
-            else:
-                st.error("لم يتم العثور على جداول قابلة للقراءة.")
+        st.dataframe(df_result, use_container_width=True)
     else:
-        st.warning("يرجى اختيار مشروع أولاً من القائمة الجانبية.")
-
-with tab1:
-    if selected_project_id:
-        st.subheader(f"📊 تقرير البروجريس: ({selected_project_name})")
-        summary_df = db.get_boq_summary(selected_project_id)
-        if not summary_df.empty:
-            st.dataframe(summary_df, use_container_width=True)
-        else:
-            st.info("لا توجد بنود تعاقدية مضافة لهذا المشروع بعد.")
-
-with tab3:
-    st.subheader("➕ إضافة مشروع جديد")
-    with st.form("new_project_form"):
-        p_name = st.text_input("اسم المشروع:")
-        p_client = st.text_input("الجهة المالكية / الاستشاري:")
-        if st.form_submit_button("إنشاء المشروع"):
-            if p_name:
-                ok, msg = db.add_project(p_name, p_client)
-                if ok:
-                    st.success(msg)
-                    st.rerun()
-                else:
-                    st.error(msg)
-
-st.divider()
-st.markdown(
-    "<center>© جميع الحقوق محفوظة - تطوير م. أحمد السيد | شركة العامرية"
-    " المتحدة للمقاولات</center>",
-    unsafe_allow_html=True,
-)
+        st.error(
+            "تعذر قراءة الجدول من الملف. تأكد من جودة ملف الـ PDF المرفق."
+        )
