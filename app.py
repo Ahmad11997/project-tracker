@@ -1,7 +1,11 @@
 import sqlite3
 from datetime import date
+import io
 import arabic_reshaper
 from bidi.algorithm import get_display
+import numpy as np
+
+# استيراد المكتبات الأساسية
 import pandas as pd
 import pdfplumber
 import streamlit as st
@@ -16,21 +20,17 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    /* تطبيق اتجاه اليمين لليسار على جميع النصوص والواجهة */
     html, body, [class*="css"], div, h1, h2, h3, h4, h5, h6, p {
         direction: rtl !important;
         text-align: right !important;
     }
-    
     .stSelectbox, .stTextInput, .stNumberInput, .stDateInput, .stFileUploader {
         direction: rtl !important;
         text-align: right !important;
     }
-    
     .stDataFrame {
         direction: rtl !important;
     }
-    
     .stButton>button {
         background-color: #2ecc71 !important;
         color: white !important;
@@ -117,37 +117,6 @@ class ProgressTrackerDB:
         )
         self.conn.commit()
 
-    def record_wir(
-        self,
-        project_id,
-        wir_id,
-        date_str,
-        boq_code,
-        location,
-        approved_qty,
-        status,
-        user_name,
-    ):
-        cursor = self.conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO wir_log (project_id, wir_id, wir_date, boq_code, location, approved_qty, status, created_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-            (
-                project_id,
-                wir_id,
-                date_str,
-                boq_code,
-                location,
-                approved_qty,
-                status,
-                user_name,
-            ),
-        )
-        self.conn.commit()
-        return True, "تم تسجيل الـ WIR بنجاح."
-
     def get_boq_summary(self, project_id, boq_code=None):
         query = """
             SELECT 
@@ -176,60 +145,84 @@ class ProgressTrackerDB:
             return pd.read_sql_query(query, self.conn, params=(project_id,))
 
 
-# --- 3. معالجة النصوص العربية المقلوبة واستخراج PDF ---
-def fix_arabic_text(text):
-    if not text or str(text).strip() in ["None", ""]:
+# --- 3. دالة معالجة واستخراج الجداول المعقدة والـ CID ---
+def fix_text_encoding(val):
+    if not val or str(val).strip() in ["None", ""]:
         return ""
-    text_str = str(text).strip()
+    text = str(val).strip()
+
+    # إذا كان النص يحتوي على رمكوز cid المشوهة يتم تنظيفه
+    if "cid:" in text:
+        return ""
+
+    # إصلاح معكوسات اللغة العربية
     try:
-        reshaped_text = arabic_reshaper.reshape(text_str)
-        return get_display(reshaped_text)
+        # فحص إذا كان الكلام يحتوي حروف عربية معكوسة
+        if any("\u0600" <= c <= "\u06ff" for c in text):
+            # إذا كان النص معكوساً بالكامل
+            reshaped = arabic_reshaper.reshape(text)
+            return get_display(reshaped)
+        return text
     except Exception:
-        return text_str
+        return text
 
 
 def extract_boq_from_pdf(pdf_file):
     all_rows = []
+
+    # استخدام pdfplumber مع إعدادات استخراج الجداول المتقدمة (Table Extraction Strategy)
+    table_settings = {
+        "vertical_strategy": "lines",
+        "horizontal_strategy": "lines",
+        "snap_tolerance": 3,
+        "join_tolerance": 3,
+    }
+
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
-            tables = page.extract_tables()
+            # المحاولة الأولى بالطرق الهندسية للجدول
+            tables = page.extract_tables(table_settings)
+
+            # إذا لم يجد جداول مسطرة، يقرأ بالاعتماد على الفراغات النصية
+            if not tables:
+                tables = page.extract_tables()
+
             for table in tables:
                 if table:
                     for row in table:
-                        cleaned_row = [fix_arabic_text(cell) for cell in row]
+                        cleaned_row = [fix_text_encoding(cell) for cell in row]
+                        # التأكد من أن الصف يحتوي على بيانات حقيقية وليس فارغاً
                         if any(cleaned_row):
                             all_rows.append(cleaned_row)
 
     if all_rows:
         raw_df = pd.DataFrame(all_rows)
-        headers = [fix_arabic_text(col) for col in raw_df.iloc[0]]
-        final_df = raw_df[1:].copy()
-        final_df.columns = [
-            f"العمود {i+1}: {h}" if h else f"العمود {i+1}"
-            for i, h in enumerate(headers)
-        ]
-        return final_df.reset_index(drop=True)
+
+        # حذف الصفوف والأعمدة الفارغة بالكامل
+        raw_df.dropna(how="all", inplace=True)
+
+        # تصحيح عناوين الأعمدة
+        cols = []
+        for i, col in enumerate(raw_df.columns):
+            cols.append(f"العمود {i+1}")
+        raw_df.columns = cols
+
+        return raw_df.reset_index(drop=True)
     return None
 
 
-# --- 4. واجهة المستخدم ---
+# --- 4. واجهة المستخدِم ---
 db = ProgressTrackerDB()
 
 st.title(
     "🏗️ منصة إدارة المشاريع والكميات - شركة العامرية المتحدة للمقاولات"
 )
 
-# الشريط الجانبي
 st.sidebar.title("👨‍💼 تطوير وإعداد")
 st.sidebar.markdown("**المهندس:** أحمد السيد")
 st.sidebar.markdown("📱 **تليفون / واتساب:** `0546226304`")
 st.sidebar.markdown("📧 **البريد:** `ahmadalsayed9797@gmail.com`")
 st.sidebar.divider()
-
-st.sidebar.title("👤 تسجيل الدخول والمشروع")
-user_name = st.sidebar.text_input(
-    "اسم المستخدم / المهندس:", value="م. أحمد السيد"
-)
 
 projects_df = db.get_projects()
 
@@ -245,15 +238,10 @@ else:
     st.sidebar.warning("يرجى إضافة مشروع جديد أولاً.")
     selected_project_id = None
 
-# التبويبات الرئيسية
-tab1, tab2, tab3, tab4 = st.tabs([
-    "📊 تقرير المشروع الحسابي",
-    "📄 قراءة BOQ من PDF",
-    "⚙️ إعدادات BOQ اليدوية",
-    "➕ إدارة المشاريع",
-])
+tab1, tab2, tab3 = st.tabs(
+    ["📊 تقرير المشروع الحسابي", "📄 قراءة BOQ من PDF", "➕ إدارة المشاريع"]
+)
 
-# تبويب قراءة PDF
 with tab2:
     if selected_project_id:
         st.subheader(
@@ -265,15 +253,18 @@ with tab2:
         )
 
         if pdf_file is not None:
-            with st.spinner("جاري قراءة وتصحيح النصوص العربية من الملف..."):
+            with st.spinner(
+                "جاري معالجة وتفكيك رموز الملف واستخراج الجدول..."
+            ):
                 extracted_df = extract_boq_from_pdf(pdf_file)
 
             if extracted_df is not None and not extracted_df.empty:
                 st.success(
-                    f"تم استخراج وتعديل النصوص بنجاح! إجمالي البنود:"
-                    f" {len(extracted_df)} بند."
+                    f"تم استخراج الجدول بنجاح! عدد الصفوف:"
+                    f" {len(extracted_df)}"
                 )
-                st.markdown("### 📋 معاينة البيانات المستخرجة:")
+
+                # تنقية وعرض الجدول
                 st.dataframe(extracted_df, use_container_width=True)
 
                 st.divider()
@@ -286,7 +277,9 @@ with tab2:
                 col4, col5, _ = st.columns(3)
 
                 with col1:
-                    col_code = st.selectbox("كود البند / الرقم:", cols, index=0)
+                    col_code = st.selectbox(
+                        "كود البند / الرقم:", cols, index=0
+                    )
                 with col2:
                     col_desc = st.selectbox(
                         "وصف البند:", cols, index=min(1, len(cols) - 1)
@@ -340,11 +333,10 @@ with tab2:
                     )
                     st.rerun()
             else:
-                st.error("لم يتم العثور على بنود قابلة للقراءة في هذا الملف.")
+                st.error("لم يتم العثور على جداول قابلة للقراءة.")
     else:
         st.warning("يرجى اختيار مشروع أولاً من القائمة الجانبية.")
 
-# تبويب تقارير البروجريس
 with tab1:
     if selected_project_id:
         st.subheader(f"📊 تقرير البروجريس: ({selected_project_name})")
@@ -354,8 +346,7 @@ with tab1:
         else:
             st.info("لا توجد بنود تعاقدية مضافة لهذا المشروع بعد.")
 
-# تبويب إضافة مشروع
-with tab4:
+with tab3:
     st.subheader("➕ إضافة مشروع جديد")
     with st.form("new_project_form"):
         p_name = st.text_input("اسم المشروع:")

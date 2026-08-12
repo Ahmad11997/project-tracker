@@ -3,3 +3,4 @@ pandas
 pdfplumber
 arabic-reshaper
 python-bidi
+numpy
