@@ -1,5 +1,7 @@
 import sqlite3
 from datetime import date
+import arabic_reshaper
+from bidi.algorithm import get_display
 import pandas as pd
 import pdfplumber
 import streamlit as st
@@ -11,7 +13,6 @@ st.set_page_config(
     page_icon="🏗️",
 )
 
-# تطبيق تنسيق اليمين لليسار (RTL) وتعديل مظهر الجداول
 st.markdown(
     """
     <style>
@@ -21,18 +22,15 @@ st.markdown(
         text-align: right !important;
     }
     
-    /* محاذاة عناصر القوائم والشريط الجانبي */
     .stSelectbox, .stTextInput, .stNumberInput, .stDateInput, .stFileUploader {
         direction: rtl !important;
         text-align: right !important;
     }
     
-    /* ضبط جدول البيانات ليناسب العرض العربي */
     .stDataFrame {
         direction: rtl !important;
     }
     
-    /* زر الحفظ الأخضر */
     .stButton>button {
         background-color: #2ecc71 !important;
         color: white !important;
@@ -178,7 +176,18 @@ class ProgressTrackerDB:
             return pd.read_sql_query(query, self.conn, params=(project_id,))
 
 
-# --- 3. دالة استخراج كافة الصفوف والجداول الحقيقية من PDF ---
+# --- 3. معالجة النصوص العربية المقلوبة واستخراج PDF ---
+def fix_arabic_text(text):
+    if not text or str(text).strip() in ["None", ""]:
+        return ""
+    text_str = str(text).strip()
+    try:
+        reshaped_text = arabic_reshaper.reshape(text_str)
+        return get_display(reshaped_text)
+    except Exception:
+        return text_str
+
+
 def extract_boq_from_pdf(pdf_file):
     all_rows = []
     with pdfplumber.open(pdf_file) as pdf:
@@ -187,30 +196,23 @@ def extract_boq_from_pdf(pdf_file):
             for table in tables:
                 if table:
                     for row in table:
-                        # تنظيف الخلايا وتفريغ قيم None
-                        cleaned_row = [
-                            str(cell).strip()
-                            if cell is not None and str(cell).strip() != "None"
-                            else ""
-                            for cell in row
-                        ]
+                        cleaned_row = [fix_arabic_text(cell) for cell in row]
                         if any(cleaned_row):
                             all_rows.append(cleaned_row)
 
     if all_rows:
         raw_df = pd.DataFrame(all_rows)
-
-        # تحسين العناوين وتسميتها Col_1, Col_2...
-        raw_df.columns = [
-            f"العمود {i+1}: {str(col).strip()}"
-            for i, col in enumerate(raw_df.iloc[0])
+        headers = [fix_arabic_text(col) for col in raw_df.iloc[0]]
+        final_df = raw_df[1:].copy()
+        final_df.columns = [
+            f"العمود {i+1}: {h}" if h else f"العمود {i+1}"
+            for i, h in enumerate(headers)
         ]
-        final_df = raw_df[1:].reset_index(drop=True)
-        return final_df
+        return final_df.reset_index(drop=True)
     return None
 
 
-# --- 4. واجهة المستخدِم ---
+# --- 4. واجهة المستخدم ---
 db = ProgressTrackerDB()
 
 st.title(
@@ -243,7 +245,7 @@ else:
     st.sidebar.warning("يرجى إضافة مشروع جديد أولاً.")
     selected_project_id = None
 
-# التبويبات الرئيسيّة
+# التبويبات الرئيسية
 tab1, tab2, tab3, tab4 = st.tabs([
     "📊 تقرير المشروع الحسابي",
     "📄 قراءة BOQ من PDF",
@@ -251,7 +253,7 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "➕ إدارة المشاريع",
 ])
 
-# تبويب قراءة BOQ الكامل من PDF
+# تبويب قراءة PDF
 with tab2:
     if selected_project_id:
         st.subheader(
@@ -263,18 +265,15 @@ with tab2:
         )
 
         if pdf_file is not None:
-            with st.spinner(
-                "جاري قراءة واستخراج كافة بنود ورسومات الملف..."
-            ):
+            with st.spinner("جاري قراءة وتصحيح النصوص العربية من الملف..."):
                 extracted_df = extract_boq_from_pdf(pdf_file)
 
             if extracted_df is not None and not extracted_df.empty:
                 st.success(
-                    f"تم استخراج جميع الصفوف بنجاح! إجمالي البنود"
-                    f" المستخرجة: {len(extracted_df)} بند."
+                    f"تم استخراج وتعديل النصوص بنجاح! إجمالي البنود:"
+                    f" {len(extracted_df)} بند."
                 )
-
-                st.markdown("### 📋 معاينة كافة البيانات المستخرجة من الملف:")
+                st.markdown("### 📋 معاينة البيانات المستخرجة:")
                 st.dataframe(extracted_df, use_container_width=True)
 
                 st.divider()
@@ -355,7 +354,7 @@ with tab1:
         else:
             st.info("لا توجد بنود تعاقدية مضافة لهذا المشروع بعد.")
 
-# تبويب إضافة مشروع جديد
+# تبويب إضافة مشروع
 with tab4:
     st.subheader("➕ إضافة مشروع جديد")
     with st.form("new_project_form"):
