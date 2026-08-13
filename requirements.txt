@@ -1,6 +1,8 @@
 streamlit
 pandas
-pdfplumber
+pdf2image
+easyocr
+pillow
+numpy
 arabic-reshaper
 python-bidi
-numpy
