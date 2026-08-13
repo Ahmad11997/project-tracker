@@ -3,11 +3,10 @@ import sqlite3
 from datetime import date
 import arabic_reshaper
 from bidi.algorithm import get_display
-import easyocr
-import numpy as np
 import pandas as pd
 from pdf2image import convert_from_bytes
 from PIL import Image
+import pytesseract
 import streamlit as st
 
 # --- 1. إعداد الصفحة والاتجاه RTL ---
@@ -44,102 +43,78 @@ st.markdown(
 )
 
 
-# --- 2. محرك قراءة الـ PDF البصري الجذرى (OCR Engine) ---
-@st.cache_resource
-def init_ocr_reader():
-    # تحميل قارئ النصوص للغتين العربية والإنجليزية
-    return easyocr.Reader(["ar", "en"], gpu=False)
-
-
-reader = init_ocr_reader()
-
-
-def process_pdf_with_ocr(pdf_bytes):
-    """تحويل الـ PDF لصور وقراءة النصوص حسب إحداثيات الصفوف والأعمدة"""
+# --- 2. محرك القراءة البصرية الجذرية (PyTesseract OCR) ---
+def process_pdf_ocr(pdf_bytes):
+    """تحويل صفحات الـ PDF إلى صور ثم قراءة النصوص هندسياً بناءً على إحداثيات الصفحة"""
     try:
         images = convert_from_bytes(pdf_bytes)
     except Exception as e:
         st.error(
-            "تأكد من تثبيت مكتبة Poppler على النظام لدعم تحويل PDF إلى صور."
+            "حدث خطأ أثناء تحويل الـ PDF لصور. تأكد من إدراج poppler-utils في"
+            " packages.txt"
         )
         return None
 
-    all_extracted_rows = []
+    all_rows = []
 
-    for page_idx, img in enumerate(images):
-        img_np = np.array(img)
+    for img in images:
+        # استخراج البيانات الهيكلية للكلمات مع الإحداثيات البصرية
+        try:
+            data = pytesseract.image_to_data(
+                img, lang="ara+eng", output_type=pytesseract.Output.DATAFRAME
+            )
+        except Exception as e:
+            st.error(
+                "تعذر تشغيل محرك Tesseract. تأكد من إضافة tesseract-ocr إلى"
+                " packages.txt"
+            )
+            return None
 
-        # استخراج الكلمات مع إحداثياتها: [(bbox, text, prob), ...]
-        results = reader.readtext(img_np)
+        # فلترة القيم الفارغة والنصوص الوهمية
+        data = data[data.text.notnull() & (data.text.str.strip() != "")]
 
-        if not results:
+        if data.empty:
             continue
 
-        # تجميع النصوص بناءً على الإحداثي الرأسي Y (الصفوف) ثم الأفقي X (الأعمدة من اليمين للياسار)
-        items = []
-        for bbox, text, prob in results:
-            if prob < 0.2:  # استبعاد القراءات الضعيفة جداً
-                continue
+        # تجميع الكلمات القريبة رأسياً في نفس الصف (Line Grouping)
+        data["line_group"] = (data["top"] / 16).astype(int)
 
-            # حساب مركز الكلمة (Y_center, X_center)
-            y_center = (bbox[0][1] + bbox[2][1]) / 2
-            x_center = (bbox[0][0] + bbox[1][0]) / 2
+        lines = []
+        for _, group in data.groupby("line_group"):
+            # فرز الكلمات داخل السطر نفسه من اليمين إلى اليسار (Left تنازلي)
+            sorted_words = group.sort_values(by="left", ascending=False)
 
-            # إصلاح النص العربي المقلوب
-            try:
-                reshaped = arabic_reshaper.reshape(text)
-                clean_text = get_display(reshaped)
-            except:
-                clean_text = text
+            row_text = []
+            for text in sorted_words["text"]:
+                try:
+                    reshaped = arabic_reshaper.reshape(str(text))
+                    clean_txt = get_display(reshaped)
+                except:
+                    clean_txt = str(text)
+                row_text.append(clean_txt)
 
-            items.append({
-                "y": y_center,
-                "x": x_center,
-                "text": clean_text.strip(),
-            })
+            if row_text:
+                lines.append(row_text)
 
-        # فرز البنود حسب الصفوف (Y)
-        items.sort(key=lambda item: item["y"])
+        all_rows.extend(lines)
 
-        # تقسيم البنود إلى صفوف (الكلمات ذات الإحداثي Y المتقارب تنتمي لنفس الصف)
-        rows = []
-        current_row = []
-        last_y = None
-        y_threshold = 18  # المسافة الرأسية لتمييز السطر الجديد
-
-        for item in items:
-            if last_y is None or abs(item["y"] - last_y) < y_threshold:
-                current_row.append(item)
-            else:
-                # ترتيب كلمات الصف الحالي من اليمين إلى اليسار (X تنازلي)
-                current_row.sort(key=lambda item: item["x"], reverse=True)
-                rows.append([it["text"] for it in current_row])
-                current_row = [item]
-            last_y = item["y"]
-
-        if current_row:
-            current_row.sort(key=lambda item: item["x"], reverse=True)
-            rows.append([it["text"] for it in current_row])
-
-        all_extracted_rows.extend(rows)
-
-    if all_extracted_rows:
-        # توحيد أطوال الأعمدة
-        max_cols = max(len(r) for r in all_extracted_rows)
-        padded_rows = [r + [""] * (max_cols - len(r)) for r in all_extracted_rows]
+    if all_rows:
+        # توحيد عدد الأعمدة لضمان العرض السليم داخل الجدول
+        max_cols = max(len(r) for r in all_rows)
+        padded_rows = [
+            r + [""] * (max_cols - len(r)) for r in all_rows
+        ]
 
         df = pd.DataFrame(padded_rows)
-        cols = [f"العمود {i+1}" for i in range(df.shape[1])]
-        df.columns = cols
+        df.columns = [f"العمود {i+1}" for i in range(df.shape[1])]
         return df
 
     return None
 
 
-# --- 3. واجهة الاستخدام ---
-st.title(
-    "🏗️ منصة إدارة المشاريع والكميات - شركة العامرية المتحدة للمقاولات"
-)
+# --- 3. واجهة المستخدم والتطبيق ---
+st.title("🏗️ شركة العامرية المتحدة للمقاولات")
+st.caption("نظام إدارة المشاريع واستخراج كميات BOQ")
 
 st.subheader("📄 الاستخراج الذكي لجدول الـ BOQ من ملف PDF مباشرة")
 
@@ -150,16 +125,18 @@ uploaded_pdf = st.file_uploader(
 if uploaded_pdf is not None:
     pdf_bytes = uploaded_pdf.read()
 
-    with st.spinner("جاري المسح البصري الذكي للـ PDF وإعادة ترتيب الجداول..."):
-        df_result = process_pdf_with_ocr(pdf_bytes)
+    with st.spinner(
+        "جاري المسح البصري للـ PDF وإعادة ترتيب الجداول والكلمات..."
+    ):
+        df_result = process_pdf_ocr(pdf_bytes)
 
     if df_result is not None and not df_result.empty:
         st.success(
-            f"تم التعرف البصري على الجدول بنجاح! إجمالي الصفوف المستخرجة:"
-            f" {len(df_result)}"
+            f"تم استخراج الجدول بنجاح! إجمالي الصفوف: {len(df_result)}"
         )
         st.dataframe(df_result, use_container_width=True)
     else:
         st.error(
-            "تعذر قراءة الجدول من الملف. تأكد من جودة ملف الـ PDF المرفق."
+            "لم يتم العثور على جداول قابلة للقراءة في هذا الملف أو الجودة غير"
+            " كافية."
         )

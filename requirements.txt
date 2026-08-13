@@ -1,8 +1,7 @@
 streamlit
 pandas
 pdf2image
-easyocr
+pytesseract
 pillow
-numpy
 arabic-reshaper
 python-bidi
