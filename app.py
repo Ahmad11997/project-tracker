@@ -4,8 +4,49 @@ import pandas as pd
 import pdfplumber
 import streamlit as st
 
+# --- 1. إعداد الصفحة والاتجاه RTL ---
+st.set_page_config(
+    page_title="شركة العامرية المتحدة للمقاولات - إدارة المشاريع",
+    layout="wide",
+    page_icon="🏗️",
+)
 
-# --- 1. محرك قاعدة البيانات المطور ---
+# تطبيق تنسيق اليمين لليسار (RTL) وتعديل مظهر الجداول
+st.markdown(
+    """
+    <style>
+    /* تطبيق اتجاه اليمين لليسار على جميع النصوص والواجهة */
+    html, body, [class*="css"], div, h1, h2, h3, h4, h5, h6, p {
+        direction: rtl !important;
+        text-align: right !important;
+    }
+    
+    /* محاذاة عناصر القوائم والشريط الجانبي */
+    .stSelectbox, .stTextInput, .stNumberInput, .stDateInput, .stFileUploader {
+        direction: rtl !important;
+        text-align: right !important;
+    }
+    
+    /* ضبط جدول البيانات ليناسب العرض العربي */
+    .stDataFrame {
+        direction: rtl !important;
+    }
+    
+    /* زر الحفظ الأخضر */
+    .stButton>button {
+        background-color: #2ecc71 !important;
+        color: white !important;
+        font-weight: bold !important;
+        border-radius: 6px !important;
+        width: 100%;
+    }
+    </style>
+""",
+    unsafe_allow_html=True,
+)
+
+
+# --- 2. محرك قاعدة البيانات ---
 class ProgressTrackerDB:
 
     def __init__(self, db_name="project_progress.db"):
@@ -14,8 +55,6 @@ class ProgressTrackerDB:
 
     def create_tables(self):
         cursor = self.conn.cursor()
-
-        # جدول المشاريع
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS projects (
                 project_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -24,18 +63,6 @@ class ProgressTrackerDB:
                 created_at TEXT
             )
         """)
-
-        # جدول المستخدمين
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE,
-                full_name TEXT,
-                role TEXT
-            )
-        """)
-
-        # جدول الـ BOQ (مرتبط بالمشروع)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS boq_master (
                 boq_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,8 +76,6 @@ class ProgressTrackerDB:
                 UNIQUE(project_id, boq_code)
             )
         """)
-
-        # جدول الـ WIRs (مرتبط بالمشروع والمستخدم)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS wir_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -105,16 +130,6 @@ class ProgressTrackerDB:
         status,
         user_name,
     ):
-        summary = self.get_boq_summary(project_id, boq_code)
-        if summary:
-            remaining_qty = summary["remaining_qty"]
-            if approved_qty > remaining_qty:
-                return (
-                    False,
-                    f"خطأ: الكمية المدخلة ({approved_qty}) تتجاوز المتبقي"
-                    f" ({remaining_qty})!",
-                )
-
         cursor = self.conn.cursor()
         cursor.execute(
             """
@@ -163,7 +178,7 @@ class ProgressTrackerDB:
             return pd.read_sql_query(query, self.conn, params=(project_id,))
 
 
-# --- دالة استخراج الجداول من PDF المحدثة مع معالجة خطأ الدمج ---
+# --- 3. دالة استخراج كافة الصفوف والجداول الحقيقية من PDF ---
 def extract_boq_from_pdf(pdf_file):
     all_rows = []
     with pdfplumber.open(pdf_file) as pdf:
@@ -172,8 +187,11 @@ def extract_boq_from_pdf(pdf_file):
             for table in tables:
                 if table:
                     for row in table:
+                        # تنظيف الخلايا وتفريغ قيم None
                         cleaned_row = [
-                            str(cell).strip() if cell is not None else ""
+                            str(cell).strip()
+                            if cell is not None and str(cell).strip() != "None"
+                            else ""
                             for cell in row
                         ]
                         if any(cleaned_row):
@@ -181,29 +199,25 @@ def extract_boq_from_pdf(pdf_file):
 
     if all_rows:
         raw_df = pd.DataFrame(all_rows)
-        header = raw_df.iloc[0]
-        final_df = raw_df[1:].copy()
-        final_df.columns = [
-            f"Col_{i+1}: {col}" for i, col in enumerate(header)
+
+        # تحسين العناوين وتسميتها Col_1, Col_2...
+        raw_df.columns = [
+            f"العمود {i+1}: {str(col).strip()}"
+            for i, col in enumerate(raw_df.iloc[0])
         ]
-        return final_df.reset_index(drop=True)
+        final_df = raw_df[1:].reset_index(drop=True)
+        return final_df
     return None
 
 
-# --- 2. واجهة التطبيق ---
+# --- 4. واجهة المستخدِم ---
 db = ProgressTrackerDB()
-
-st.set_page_config(
-    page_title="شركة العامرية المتحدة للمقاولات - إدارة المشاريع",
-    layout="wide",
-    page_icon="🏗️",
-)
 
 st.title(
     "🏗️ منصة إدارة المشاريع والكميات - شركة العامرية المتحدة للمقاولات"
 )
 
-# --- الشريط الجانبي ---
+# الشريط الجانبي
 st.sidebar.title("👨‍💼 تطوير وإعداد")
 st.sidebar.markdown("**المهندس:** أحمد السيد")
 st.sidebar.markdown("📱 **تليفون / واتساب:** `0546226304`")
@@ -225,48 +239,11 @@ if not projects_df.empty:
         "📂 اختر المشروع الحالي:", list(project_options.keys())
     )
     selected_project_id = project_options[selected_project_name]
-
-    st.sidebar.divider()
-    st.sidebar.header(f"📝 إدخال WIR مشروع: {selected_project_name}")
-
-    boq_df = db.get_boq_summary(selected_project_id)
-
-    if not boq_df.empty:
-        boq_list = boq_df["boq_code"].tolist()
-        selected_boq = st.sidebar.selectbox("اختر بند الـ BOQ:", boq_list)
-        wir_no = st.sidebar.text_input("رقم الـ WIR:")
-        wir_date = st.sidebar.date_input("تاريخ الاعتماد:", date.today())
-        location = st.sidebar.text_input("الموقع / المحطة:")
-        approved_qty = st.sidebar.number_input(
-            "الكمية المعتمدة:", min_value=0.0, step=1.0
-        )
-        status = st.sidebar.selectbox("حالة الاعتماد:", ["Code A", "Code B"])
-
-        if st.sidebar.button("حفظ الـ WIR"):
-            success, msg = db.record_wir(
-                selected_project_id,
-                wir_no,
-                str(wir_date),
-                selected_boq,
-                location,
-                approved_qty,
-                status,
-                user_name,
-            )
-            if success:
-                st.sidebar.success(msg)
-                st.rerun()
-            else:
-                st.sidebar.error(msg)
-    else:
-        st.sidebar.info("قم بإضافة جدول الكميات BOQ لهذا المشروع أولاً.")
 else:
-    st.sidebar.warning(
-        "لا توجد مشاريع مضافة حالياً. يرجى إضافة مشروع جديد."
-    )
+    st.sidebar.warning("يرجى إضافة مشروع جديد أولاً.")
     selected_project_id = None
 
-# --- تبويبات المنصة ---
+# التبويبات الرئيسيّة
 tab1, tab2, tab3, tab4 = st.tabs([
     "📊 تقرير المشروع الحسابي",
     "📄 قراءة BOQ من PDF",
@@ -274,91 +251,61 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "➕ إدارة المشاريع",
 ])
 
-# Tab 1: تقارير المشروع المختار
-with tab1:
-    if selected_project_id:
-        st.subheader(
-            f"📊 تقرير البروجريس الخاص بمشروع: ({selected_project_name})"
-        )
-        summary_df = db.get_boq_summary(selected_project_id)
-
-        if not summary_df.empty:
-            total_contract = summary_df["total_budget"].sum()
-            total_earned = summary_df["earned_value"].sum()
-            overall_progress = (
-                (total_earned / total_contract * 100)
-                if total_contract > 0
-                else 0
-            )
-
-            col1, col2, col3 = st.columns(3)
-            col1.metric("إجمالي قيمة العقد", f"{total_contract:,.2f} SAR")
-            col2.metric("القيمة المكتسبة (EV)", f"{total_earned:,.2f} SAR")
-            col3.metric("نسبة الإنجاز المالي", f"{overall_progress:.2f} %")
-
-            st.dataframe(summary_df, use_container_width=True)
-
-            excel_data = summary_df.to_csv(index=False).encode("utf-8-sig")
-            st.download_button(
-                f"📥 تصدير تقرير ({selected_project_name})",
-                excel_data,
-                f"{selected_project_name}_Progress.csv",
-                "text/csv",
-            )
-        else:
-            st.info("لا توجد بنود تعاقدية مضافة لهذا المشروع بعد.")
-    else:
-        st.warning(
-            "يرجى اختيار أو إضافة مشروع من القائمة الجانبية أو تبويب إدارة"
-            " المشاريع."
-        )
-
-# Tab 2: استخراج BOQ تلقائياً من ملفات PDF
+# تبويب قراءة BOQ الكامل من PDF
 with tab2:
     if selected_project_id:
         st.subheader(
-            "📄 رفع واستخراج جدول الكميات (BOQ) من ملف PDF لـ"
+            "📄 قراءة واستخراج جميع بنود الـ BOQ من ملف PDF لـ"
             f" ({selected_project_name})"
         )
         pdf_file = st.file_uploader(
-            "اختر ملف BOQ بصيغة PDF", type=["pdf"], key="boq_pdf_uploader"
+            "اختر ملف الـ BOQ بصيغة PDF", type=["pdf"], key="boq_pdf_uploader"
         )
 
         if pdf_file is not None:
-            with st.spinner("جاري قراءة وتحليل ملف الـ PDF..."):
+            with st.spinner(
+                "جاري قراءة واستخراج كافة بنود ورسومات الملف..."
+            ):
                 extracted_df = extract_boq_from_pdf(pdf_file)
 
             if extracted_df is not None and not extracted_df.empty:
-                st.success("تم قراءة مستند الـ PDF بنجاح!")
-                st.markdown("### معاينة الجدول المستخرج:")
+                st.success(
+                    f"تم استخراج جميع الصفوف بنجاح! إجمالي البنود"
+                    f" المستخرجة: {len(extracted_df)} بند."
+                )
+
+                st.markdown("### 📋 معاينة كافة البيانات المستخرجة من الملف:")
                 st.dataframe(extracted_df, use_container_width=True)
 
                 st.divider()
-                st.markdown("#### 📥 حفظ البيانات المستخرجة في قاعدة البيانات")
-                st.info(
-                    "حدد الأعمدة المناسبة لتسكينها مباشرة في قاعدة البيانات:"
+                st.markdown(
+                    "### 💾 ربط وتسكين الأعمدة في قاعدة بيانات المشروع"
                 )
 
                 cols = list(extracted_df.columns)
-                col_code = st.selectbox(
-                    "عمود كود البند (BOQ Code):", cols, index=0
-                )
-                col_desc = st.selectbox(
-                    "عمود الوصف (Description):",
-                    cols,
-                    index=min(1, len(cols) - 1),
-                )
-                col_unit = st.selectbox(
-                    "عمود الوحدة (Unit):", cols, index=min(2, len(cols) - 1)
-                )
-                col_qty = st.selectbox(
-                    "عمود الكمية (Qty):", cols, index=min(3, len(cols) - 1)
-                )
-                col_rate = st.selectbox(
-                    "عمود الفئة/السعر (Rate):", cols, index=min(4, len(cols) - 1)
-                )
+                col1, col2, col3 = st.columns(3)
+                col4, col5, _ = st.columns(3)
 
-                if st.button("حفظ الجدول المستخرج في هذا المشروع"):
+                with col1:
+                    col_code = st.selectbox("كود البند / الرقم:", cols, index=0)
+                with col2:
+                    col_desc = st.selectbox(
+                        "وصف البند:", cols, index=min(1, len(cols) - 1)
+                    )
+                with col3:
+                    col_unit = st.selectbox(
+                        "الوحدة:", cols, index=min(2, len(cols) - 1)
+                    )
+                with col4:
+                    col_qty = st.selectbox(
+                        "الكمية:", cols, index=min(3, len(cols) - 1)
+                    )
+                with col5:
+                    col_rate = st.selectbox(
+                        "السعر / الفئة:", cols, index=min(4, len(cols) - 1)
+                    )
+
+                if st.button("✅ حفظ الجدول كاملاً في قاعدة البيانات"):
                     saved_count = 0
                     for _, row in extracted_df.iterrows():
                         try:
@@ -390,51 +337,30 @@ with tab2:
                             continue
 
                     st.success(
-                        f"تم حفظ {saved_count} بند بنجاح في قاعدة البيانات!"
+                        f"تم حفظ {saved_count} بند في المشروع بنجاح!"
                     )
                     st.rerun()
             else:
-                st.error(
-                    "لم يتم العثور على جداول واضحة في الملف. تأكد أن ملف الـ PDF"
-                    " ليس عبارة عن صور ممسوحة ضوئياً (Scanned)."
-                )
+                st.error("لم يتم العثور على بنود قابلة للقراءة في هذا الملف.")
     else:
         st.warning("يرجى اختيار مشروع أولاً من القائمة الجانبية.")
 
-# Tab 3: إعدادات BOQ اليدوية
-with tab3:
+# تبويب تقارير البروجريس
+with tab1:
     if selected_project_id:
-        st.subheader(f"إضافة بند يدوياً لمشروع: ({selected_project_name})")
-        with st.form("boq_form"):
-            b_code = st.text_input("كود البند (BOQ Code):")
-            b_desc = st.text_input("وصف البند:")
-            b_unit = st.text_input("الوحدة:")
-            b_qty = st.number_input("الكمية التعاقدية:", min_value=0.0)
-            b_rate = st.number_input("فئة السعر (Unit Rate):", min_value=0.0)
+        st.subheader(f"📊 تقرير البروجريس: ({selected_project_name})")
+        summary_df = db.get_boq_summary(selected_project_id)
+        if not summary_df.empty:
+            st.dataframe(summary_df, use_container_width=True)
+        else:
+            st.info("لا توجد بنود تعاقدية مضافة لهذا المشروع بعد.")
 
-            if st.form_submit_button("حفظ البند في هذا المشروع"):
-                db.add_boq_item(
-                    selected_project_id,
-                    b_code,
-                    b_desc,
-                    b_unit,
-                    b_qty,
-                    b_rate,
-                )
-                st.success("تم حفظ البند بنجاح داخل هذا المشروع!")
-                st.rerun()
-    else:
-        st.warning(
-            "قم باختيار أو إنشاء مشروع أولاً لكي تتمكن من إدخال البنود."
-        )
-
-# Tab 4: إنشاء وإدارة المشاريع الجديدة
+# تبويب إضافة مشروع جديد
 with tab4:
-    st.subheader("➕ إضافة مشروع جديد إلى النظام")
+    st.subheader("➕ إضافة مشروع جديد")
     with st.form("new_project_form"):
-        p_name = st.text_input("اسم المشروع (مثال: شبكات مياه حائل):")
+        p_name = st.text_input("اسم المشروع:")
         p_client = st.text_input("الجهة المالكية / الاستشاري:")
-
         if st.form_submit_button("إنشاء المشروع"):
             if p_name:
                 ok, msg = db.add_project(p_name, p_client)
@@ -443,8 +369,6 @@ with tab4:
                     st.rerun()
                 else:
                     st.error(msg)
-            else:
-                st.error("يرجى إدخال اسم المشروع.")
 
 st.divider()
 st.markdown(
